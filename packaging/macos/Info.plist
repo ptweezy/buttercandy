@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The app bundle's description. .github/scripts/macos_bundle.sh fills in
+  @VERSION@. The two usage strings are what macOS shows when it asks for
+  permission; without them it refuses instead of asking.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>buttercandy</string>
+	<key>CFBundleExecutable</key>
+	<string>buttercandy</string>
+	<key>CFBundleIconFile</key>
+	<string>buttercandy</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.ptweezy.buttercandy</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>buttercandy</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.music</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.2</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>buttercandy listens to what your Mac is playing so the picture can move with it. Nothing is recorded or sent anywhere.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 Parker Loflin. Free software under the GNU AGPL, version 3.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>buttercandy listens to the microphone when you pick it as the source. Nothing is recorded or sent anywhere.</string>
+</dict>
+</plist>

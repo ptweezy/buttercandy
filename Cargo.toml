@@ -1,0 +1,48 @@
+[package]
+name = "buttercandy"
+version = "0.1.0"
+edition = "2024"
+description = "A modern, tricked-out music visualizer"
+authors = ["Parker Loflin"]
+license = "AGPL-3.0-only"
+repository = "https://github.com/ptweezy/buttercandy"
+publish = false
+
+[dependencies]
+bytemuck = { version = "1.25", features = ["derive"] }
+cosmic-text = "0.19"
+cpal = "0.18"
+dirs = "7"
+env_logger = "0.11"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+log = "0.4"
+pollster = "1"
+rfd = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sys-locale = "0.3"
+symphonia = { version = "0.5", features = ["all", "opt-simd"] }
+wgpu = "30"
+winit = "0.30"
+
+# On Linux it is the sound server (PulseAudio, or PipeWire speaking its
+# protocol) that knows about monitor sources, which is how system audio is
+# captured there. This client is pure Rust: nothing extra to install.
+[target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18", features = ["pulseaudio"] }
+
+# Keep our own code quick to rebuild, but never run the decoders, DSP or text
+# shaping unoptimised: a debug build should still hold 60 fps.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+strip = true
+
+[dev-dependencies]
+# Lets the test suite validate every shader without needing a GPU.
+naga = { version = "30", features = ["wgsl-in"] }

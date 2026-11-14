@@ -1,0 +1,17 @@
+# Weekly updates for the actions the pipeline uses, in one pull request.
+version: 2
+updates:
+  # Actions are pinned to commit SHAs with a trailing version comment
+  # (actions/checkout@<sha> # v7.0.1). Dependabot updates the comment only
+  # when it ends with the version, so put other notes on the line above.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    # Leave a new release alone for its first week: a bad or hijacked one is
+    # usually pulled within days.
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]

@@ -1,0 +1,676 @@
+name: CI
+
+# Every push (any branch) and pull request formats, lints and tests the code,
+# then builds and packages it for every system a release ships: Windows and
+# Linux on x64 and ARM64, and one universal macOS app. A release gates on all
+# of it.
+#
+# A release happens ONLY on:
+#   - a push to `main` where a pushed commit SUBJECT starts with a marker:
+#         [release]          -> minor (default)
+#         [release:major]    -> major
+#         [release:minor]    -> minor
+#         [release:patch]    -> patch
+#     The newest marked commit wins. Bodies are never scanned, so prose that
+#     mentions a marker cannot trigger a release. A marker releases on every
+#     push that carries it: when a commit is amended and pushed again, reword
+#     its subject first unless another release is wanted.
+#   - workflow_dispatch: `bump` from the dropdown, or an exact X.Y.Z `tag`
+#     (the `tag` input wins over `bump`).
+# Example subject: [release:minor] Add a palette picker
+#
+# Versions come from tags, which are bare X.Y.Z: the next one is counted from
+# the latest tag and stamped into the build (.github/scripts/set_version.sh),
+# so the version committed in Cargo.toml is only what a local build reports.
+# The first `[release]` makes 0.1.0.
+#
+# Publication starts only after every build and test job succeeds: the tag,
+# then a GitHub Release with each download and one SHA256SUMS. If HISTORY.md
+# has a `## X.Y.Z` section for the version, it leads the release notes.
+#
+# Signing is optional and all-or-nothing per system. With its secrets set, a
+# release signs that system's build and fails if signing does; with none of
+# them set, it ships unsigned and says so in the release notes.
+#   Windows (Azure Artifact Signing, through OIDC: the app registration needs
+#   a federated credential for this repository's `main` branch):
+#     AZURE_TENANT_ID  AZURE_CLIENT_ID  AZURE_SUBSCRIPTION_ID
+#     AZURE_SIGNING_ENDPOINT  AZURE_SIGNING_ACCOUNT  AZURE_SIGNING_PROFILE
+#   macOS (a Developer ID Application certificate and a notary API key):
+#     MACOS_CERT_P12_BASE64  MACOS_CERT_PASSWORD  MACOS_SIGN_IDENTITY
+#     MACOS_NOTARY_KEY_BASE64  MACOS_NOTARY_KEY_ID  MACOS_NOTARY_ISSUER_ID
+
+on:
+  push:
+    branches: ["**"]  # build + test on every commit, on every branch
+  pull_request:       # and on every PR (covers fork PRs, which don't push here)
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump level (ignored when 'tag' is set)"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      tag:
+        description: "Exact version to release as X.Y.Z (overrides bump); leave blank to compute the next one"
+        type: string
+        default: ""
+
+# One in-flight run per (head repo, branch, kind); a same-repo push and its PR
+# share a group. The HEAD repo keeps a fork PR from a branch named `main` out
+# of the push-to-main group, where it would cancel a release mid-publish. The
+# kind gives releases their own group, and a release is never cancelled.
+#
+# The release test is a loose superset of the `version` job's decision (a
+# false negative could cancel a publish): any dispatch, or a push to `main`
+# with a message containing `[release`, or with 20+ commits, where the event
+# payload truncates.
+concurrency:
+  group: ci-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}-${{ (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && (contains(github.event.head_commit.message, '[release') || contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null))) && 'release' || 'ci' }}
+  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && (contains(github.event.head_commit.message, '[release') || contains(join(github.event.commits.*.message, '|'), '[release') || github.event.commits[19] != null))) }}
+
+# Least privilege for every job; the two publishing jobs opt up to the one
+# extra scope each needs.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash  # on Windows too
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # Decide + version (runs on every event; feeds the builds and the publish).
+  # ---------------------------------------------------------------------------
+
+  # Decide whether this run releases, and compute the one version every build
+  # is stamped with. This file runs on every branch and PR, so the script
+  # enforces the main-only release rule.
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.v.outputs.release }}
+      new: ${{ steps.v.outputs.new }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0  # full history + tags: the marker scan and the tag math need both
+          persist-credentials: false
+      - name: Decide release and compute version
+        id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          INPUT_BUMP: ${{ github.event.inputs.bump }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: bash .github/scripts/version.sh
+
+  # ---------------------------------------------------------------------------
+  # Checks, tests and builds: all of them on EVERY event, side by side.
+  # ---------------------------------------------------------------------------
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint the pipeline's scripts
+        run: shellcheck .github/scripts/*.sh
+
+  # Clippy and the test suite on each system's own hardware. The target is
+  # named outright so that an ARM64 runner whose toolchain defaults to x64
+  # cannot quietly test the wrong thing.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: windows-amd64, runner: windows-latest, target: x86_64-pc-windows-msvc}
+          - {name: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc}
+          - {name: macos-arm64, runner: macos-15, target: aarch64-apple-darwin}
+          - {name: linux-amd64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu}
+          - {name: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu}
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+          components: clippy
+      # Only `main` writes caches; every other branch and PR reads them.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+      - name: Lint
+        run: cargo clippy --all-targets --locked --target "$TARGET" -- -D warnings
+      # The tests need neither a GPU nor an audio device.
+      - name: Test
+        run: cargo test --locked --target "$TARGET"
+
+  # The Windows and Linux downloads. Linux builds on Ubuntu 24.04 on purpose:
+  # a binary runs on its build system's glibc (2.39) or newer, never older.
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {asset: windows-amd64, runner: windows-latest, target: x86_64-pc-windows-msvc}
+          - {asset: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc}
+          - {asset: linux-amd64, runner: ubuntu-24.04, target: x86_64-unknown-linux-gnu}
+          - {asset: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu}
+    name: build (${{ matrix.asset }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.version.outputs.new }}
+      ASSET: ${{ matrix.asset }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libasound2-dev pkg-config
+      - name: Stamp the version
+        run: bash .github/scripts/set_version.sh "$VERSION"
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+      # Fails the job if the program cannot start. Neither check needs a GPU
+      # or an audio device.
+      - name: Smoke-test the binary
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/buttercandy"
+          if [ "$RUNNER_OS" = "Windows" ]; then bin="$bin.exe"; fi
+          reported="$("$bin" --version)"
+          echo "reported: ${reported:-<nothing>}"
+          if [ "$reported" != "buttercandy $VERSION" ]; then
+            echo "::error::expected 'buttercandy $VERSION', got '$reported'"
+            exit 1
+          fi
+          "$bin" --icon "$RUNNER_TEMP/icon.png" --size 64x64
+          test -s "$RUNNER_TEMP/icon.png"
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          mkdir -p stage/buttercandy dist
+          cp "target/$TARGET/release/buttercandy" LICENSE README.md THIRD-PARTY.md stage/buttercandy/
+          tar -C stage -czf "dist/buttercandy-$ASSET.tar.gz" buttercandy
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force stage/buttercandy, dist | Out-Null
+          Copy-Item "target/$env:TARGET/release/buttercandy.exe", LICENSE, README.md, THIRD-PARTY.md stage/buttercandy/
+          Compress-Archive -Path stage/buttercandy -DestinationPath "dist/buttercandy-$env:ASSET.zip"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: buttercandy-${{ matrix.asset }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  # The macOS download: both architectures built on one Apple silicon runner,
+  # merged into a universal buttercandy.app and wrapped in a disk image. Every
+  # run assembles the whole thing; a release signs and notarizes it when the
+  # signing secrets are set.
+  build-macos:
+    needs: version
+    runs-on: macos-15
+    timeout-minutes: 60
+    outputs:
+      signed: ${{ steps.creds.outputs.signed }}
+    env:
+      VERSION: ${{ needs.version.outputs.new }}
+      # The audio library's floor. LSMinimumSystemVersion in
+      # packaging/macos/Info.plist says the same.
+      MACOSX_DEPLOYMENT_TARGET: "14.2"
+      DMG: dist/buttercandy-macos-universal.dmg
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: macos-universal
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Before compiling, so a bad certificate fails in a minute, not thirty.
+      - name: Prepare macOS signing credentials
+        id: creds
+        if: needs.version.outputs.release == 'true'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_KEY_BASE64: ${{ secrets.MACOS_NOTARY_KEY_BASE64 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          # All six or none (an unset secret arrives empty).
+          total=0
+          absent=0
+          missing=""
+          for name in MACOS_CERT_P12_BASE64 MACOS_CERT_PASSWORD MACOS_SIGN_IDENTITY \
+                      MACOS_NOTARY_KEY_BASE64 MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID; do
+            total=$((total + 1))
+            if [ -z "${!name:-}" ]; then
+              absent=$((absent + 1))
+              missing="$missing $name"
+            fi
+          done
+          if [ "$absent" -eq "$total" ]; then
+            echo "::warning::macOS signing secrets not set; shipping an unsigned, unnotarized app."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$absent" -gt 0 ]; then
+            echo "::error::macOS signing is half configured; missing:$missing"
+            exit 1
+          fi
+
+          # Import the Developer ID certificate into a throwaway keychain with
+          # a random password, scoped to this runner (never the login one).
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PW="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" \
+            -t cert -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          # Let codesign use the key without a prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          # Exercise the identity and the notary key before compiling.
+          cp /usr/bin/true "$RUNNER_TEMP/signing-probe"
+          codesign --force --options runtime --timestamp --keychain "$KEYCHAIN" \
+            --sign "$MACOS_SIGN_IDENTITY" "$RUNNER_TEMP/signing-probe"
+          echo "$MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/AuthKey.p8"
+          xcrun notarytool history --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER_ID" >/dev/null
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+      - name: Stamp the version
+        run: bash .github/scripts/set_version.sh "$VERSION"
+      - name: Build both architectures
+        run: cargo build --release --locked --target aarch64-apple-darwin --target x86_64-apple-darwin
+      - name: Assemble the app bundle
+        run: |
+          set -euo pipefail
+          bash .github/scripts/macos_bundle.sh "$VERSION" \
+            target/aarch64-apple-darwin/release/buttercandy \
+            target/x86_64-apple-darwin/release/buttercandy \
+            build
+      # With a certificate: the hardened runtime and a secure timestamp, both
+      # of which notarization requires. Without one: an ad-hoc signature,
+      # which Apple silicon needs before it will run anything at all.
+      - name: Sign the app
+        env:
+          SIGNED: ${{ steps.creds.outputs.signed }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ "$SIGNED" = "true" ]; then
+            codesign --force --options runtime --timestamp \
+              --entitlements packaging/macos/entitlements.plist \
+              --keychain "$RUNNER_TEMP/build.keychain-db" \
+              --sign "$MACOS_SIGN_IDENTITY" build/buttercandy.app
+          else
+            codesign --force --sign - build/buttercandy.app
+          fi
+          codesign --verify --deep --strict --verbose=2 build/buttercandy.app
+      # Each half of the universal binary, as shipped: the Intel one runs
+      # under Rosetta here. Fails the job if either cannot start.
+      - name: Smoke-test both architectures
+        run: |
+          set -euo pipefail
+          bin=build/buttercandy.app/Contents/MacOS/buttercandy
+          for arch in arm64 x86_64; do
+            reported="$(arch "-$arch" "$bin" --version)"
+            echo "$arch reported: $reported"
+            if [ "$reported" != "buttercandy $VERSION" ]; then
+              echo "::error::$arch: expected 'buttercandy $VERSION', got '$reported'"
+              exit 1
+            fi
+          done
+      - name: Build the disk image
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/dmg"
+          mkdir -p "$staging" dist
+          ditto build/buttercandy.app "$staging/buttercandy.app"
+          ln -s /Applications "$staging/Applications"
+          # hdiutil fails now and then on a busy runner ("Resource busy").
+          for attempt in 1 2 3; do
+            if hdiutil create -volname buttercandy -srcfolder "$staging" \
+                 -fs HFS+ -format UDZO -ov "$DMG"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::hdiutil could not build the disk image"
+              exit 1
+            fi
+            sleep 10
+          done
+          hdiutil verify "$DMG"
+      # The ticket covers the app inside the image; stapling puts a copy on
+      # the image so that Gatekeeper can check it offline.
+      - name: Sign and notarize the disk image
+        if: steps.creds.outputs.signed == 'true'
+        timeout-minutes: 30
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          codesign --force --timestamp --keychain "$RUNNER_TEMP/build.keychain-db" \
+            --sign "$MACOS_SIGN_IDENTITY" "$DMG"
+          result="$(xcrun notarytool submit "$DMG" \
+            --key "$RUNNER_TEMP/AuthKey.p8" \
+            --key-id "$MACOS_NOTARY_KEY_ID" \
+            --issuer "$MACOS_NOTARY_ISSUER_ID" \
+            --wait --output-format json)"
+          echo "$result"
+          # notarytool exits 0 for a rejected submission too: read the status.
+          status="$(printf '%s' "$result" | plutil -extract status raw -o - -)"
+          if [ "$status" != "Accepted" ]; then
+            id="$(printf '%s' "$result" | plutil -extract id raw -o - -)"
+            xcrun notarytool log "$id" \
+              --key "$RUNNER_TEMP/AuthKey.p8" \
+              --key-id "$MACOS_NOTARY_KEY_ID" \
+              --issuer "$MACOS_NOTARY_ISSUER_ID" || true
+            echo "::error::notarization ended as '$status'"
+            exit 1
+          fi
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: buttercandy-macos-universal
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # Publish: release only, after every job above succeeds. A skipped `release`
+  # publishes nothing; do NOT add always().
+  # ---------------------------------------------------------------------------
+
+  # Authenticode-sign the Windows builds on a release. One x64 job signs both
+  # architectures (Authenticode does not care which), which keeps
+  # id-token: write out of the build jobs. The exe is signed, then zipped
+  # again, so the download carries the signed file.
+  sign-windows:
+    needs: [version, build]
+    if: needs.version.outputs.release == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write   # OIDC federation for azure/login; no stored client secret
+    outputs:
+      signed: ${{ steps.creds.outputs.signed }}
+    steps:
+      - name: Look for the signing secrets
+        id: creds
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          AZURE_SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          AZURE_SIGNING_ACCOUNT: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          AZURE_SIGNING_PROFILE: ${{ secrets.AZURE_SIGNING_PROFILE }}
+        run: |
+          set -euo pipefail
+          # All six or none (an unset secret arrives empty).
+          total=0
+          absent=0
+          missing=""
+          for name in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_SUBSCRIPTION_ID \
+                      AZURE_SIGNING_ENDPOINT AZURE_SIGNING_ACCOUNT AZURE_SIGNING_PROFILE; do
+            total=$((total + 1))
+            if [ -z "${!name:-}" ]; then
+              absent=$((absent + 1))
+              missing="$missing $name"
+            fi
+          done
+          if [ "$absent" -eq "$total" ]; then
+            echo "::warning::Windows signing secrets not set; shipping unsigned Windows builds."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$absent" -gt 0 ]; then
+            echo "::error::Windows signing is half configured; missing:$missing"
+            exit 1
+          fi
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+      - name: Download the Windows builds
+        if: steps.creds.outputs.signed == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: buttercandy-windows-*
+          merge-multiple: true
+          path: unsigned
+      - name: Unpack them
+        if: steps.creds.outputs.signed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($arch in 'amd64', 'arm64') {
+            Expand-Archive "unsigned/buttercandy-windows-$arch.zip" -DestinationPath "work/$arch"
+            if (-not (Test-Path "work/$arch/buttercandy/buttercandy.exe")) {
+              throw "buttercandy-windows-$arch.zip holds no buttercandy/buttercandy.exe"
+            }
+          }
+      - name: Log in to Azure (OIDC)
+        if: steps.creds.outputs.signed == 'true'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      # Keep the timestamp: without one a signature dies with the leaf
+      # certificate, which Artifact Signing rotates within days. The first
+      # attempt may fail (the action installs a PowerShell module on every
+      # call, which flakes); the second must not. Signing twice is safe:
+      # signtool replaces a signature.
+      - name: Sign both exes
+        id: sign1
+        if: steps.creds.outputs.signed == 'true'
+        continue-on-error: true
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\work
+          files-folder-filter: exe
+          files-folder-recurse: true
+          description: buttercandy
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: Sign both exes (retry)
+        if: steps.creds.outputs.signed == 'true' && steps.sign1.outcome == 'failure'
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: ${{ github.workspace }}\work
+          files-folder-filter: exe
+          files-folder-recurse: true
+          description: buttercandy
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: Verify the signatures and zip the builds again
+        if: steps.creds.outputs.signed == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force signed | Out-Null
+          foreach ($arch in 'amd64', 'arm64') {
+            $exe = "work/$arch/buttercandy/buttercandy.exe"
+            $sig = Get-AuthenticodeSignature $exe
+            if ($sig.Status -ne 'Valid') {
+              throw "unsigned or invalid signature on ${exe}: $($sig.Status) $($sig.StatusMessage)"
+            }
+            Write-Host "OK $exe -> $($sig.SignerCertificate.Subject)"
+            # Same shape as the build job: one top-level buttercandy/ folder.
+            Compress-Archive -Path "work/$arch/buttercandy" -DestinationPath "signed/buttercandy-windows-$arch.zip"
+          }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.creds.outputs.signed == 'true'
+        with:
+          name: signed-windows
+          path: signed/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  release:
+    needs: [version, lint, test, build, build-macos, sign-windows]
+    if: needs.version.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write   # push the tag and create the GitHub Release
+    env:
+      NEW: ${{ needs.version.outputs.new }}
+      GH_REPO: ${{ github.repository }}
+      # Every file a release carries, besides SHA256SUMS. A missing one
+      # fails the release.
+      ASSETS: >-
+        buttercandy-windows-amd64.zip
+        buttercandy-windows-arm64.zip
+        buttercandy-macos-universal.dmg
+        buttercandy-linux-amd64.tar.gz
+        buttercandy-linux-arm64.tar.gz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false  # the tag step passes its token itself
+      - name: Download every build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: buttercandy-*
+          merge-multiple: true
+          path: dist
+      # Overlay the signed Windows files before anything hashes or attaches
+      # them, so SHA256SUMS and the Release describe the signed bytes.
+      - name: Overlay the signed Windows builds
+        if: needs.sign-windows.outputs.signed == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed-windows
+          path: dist
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          read -ra assets <<<"$ASSETS"
+          for file in "${assets[@]}"; do
+            if [ ! -s "$file" ]; then
+              echo "::error::$file is missing from the builds"
+              exit 1
+            fi
+          done
+          sha256sum -- "${assets[@]}" > SHA256SUMS
+          cat SHA256SUMS
+      - name: Write the release notes
+        env:
+          WINDOWS_SIGNED: ${{ needs.sign-windows.outputs.signed }}
+          MACOS_SIGNED: ${{ needs.build-macos.outputs.signed }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/release_notes.sh "$NEW" "$WINDOWS_SIGNED" "$MACOS_SIGNED" > release-notes.md
+          cat release-notes.md
+      - name: Tag the release
+        env:
+          # RELEASE_TOKEN is optional. The job's own token can tag a commit
+          # that is still on a branch; if `main` was rewritten while this run
+          # was building, the commit has to be pushed along with the tag, and
+          # pushing its workflow file takes a token with the workflow scope.
+          TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          remote="https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # On a re-run the tag is already on the remote: skip it when it
+          # names this commit, fail when it names another. ls-remote lists the
+          # tag and then the commit it peels to, so the last line is the commit.
+          existing="$(git ls-remote --tags "$remote" "refs/tags/$NEW" "refs/tags/$NEW^{}" | tail -n1 | cut -f1)"
+          if [ -n "$existing" ]; then
+            if [ "$existing" = "$(git rev-parse HEAD)" ]; then
+              echo "tag $NEW already points at HEAD; skipping"
+              exit 0
+            fi
+            echo "::error::tag $NEW already exists at $existing, not HEAD $(git rev-parse HEAD)"
+            exit 1
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$NEW" -m "Release $NEW"
+          git push "$remote" "refs/tags/$NEW"
+      # Everything is attached in this one step, and the Release is published
+      # only once every upload has finished.
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$NEW" >/dev/null 2>&1; then
+            echo "release $NEW already exists; skipping"
+            exit 0
+          fi
+          read -ra assets <<<"$ASSETS"
+          gh release create "$NEW" --verify-tag --title "$NEW" \
+            --notes-file release-notes.md \
+            dist/SHA256SUMS "${assets[@]/#/dist/}"
